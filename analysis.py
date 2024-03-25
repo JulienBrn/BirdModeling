@@ -22,8 +22,8 @@ import matplotlib.pyplot as plt
 # Loading Data
 
 all_folders = list(Path("/media/julien/data1/CarmenData/").iterdir())
-target_folder =all_folders[0]
-unit_name = 'ch12#1'
+target_folder =all_folders[1]
+unit_name = 'ch12#2'
 
 inputs_folder = target_folder / 'Inputs'
 extracted_files_folder = target_folder / 'Extracted_files'
@@ -154,10 +154,6 @@ if type(bp_in_sp) is not list:
 # Converting to xarray
 
 
-LMAN_lag_in_sec = 0.005
-premotor_window_length_in_sec = 0.04
-pitch_window_length_in_sec = 0.025
-feat_window_length_in_sec = 0.025
 pitch_lower_bound = metadata["pitch_lower_bounds"]
 pitch_upper_bound = metadata["pitch_upper_bounds"]
 
@@ -165,7 +161,6 @@ import xarray as xr, xarray_helper as xrh
 dataset = labels_df[["syb", "beg", "end"]].to_xarray().rename(index="syllable_index")
 dataset["song_data"] = xr.DataArray(song[:, 0], dims="song_index", coords=dict(song_index=range(song.size)))
 dataset["song_fs"] = fs_mic
-# dataset["LMAN_lag_s"] = LMAN_lag_in_sec
 dataset["song_t"] = dataset["song_index"]/dataset["song_fs"]
 
 print(dataset)
@@ -177,6 +172,9 @@ dataset["ifr_t"] = dataset["ifr_index"]/dataset["ifr_fs"]
 dataset = dataset.set_coords(["ifr_t", "song_t", "ifr_fs", "song_fs"])
 print(dataset)
 
+
+# dataset["ifr"].plot()
+# plt.show()
 # ============================================================================ #
 # Filtering according to motif
 
@@ -238,16 +236,27 @@ print(dataset)
 # ============================================================================ #
 # Computing song features
 
+progress = tqdm(desc="pitch feature")
+progress.total = dataset["subsyllable_beg"].size
+
 def compute_pitch(a):
-    return a[0]
+    global progress
+    progress.update(1)
+    from pitch import processPitch
+    return processPitch(a, dataset["song_fs"].item(), 1000, 10000)
 def compute_amp(a): 
     return np.mean(a)
 def compute_entropy(a): 
-    return a[2]
+    from scipy.signal import welch
+    f, p = welch(a)
+    p /= np.sum(p)
+    power_per_band_mat = p[p > 0]
+    spectral_mat = -np.sum(power_per_band_mat * np.log2(power_per_band_mat))
+    return spectral_mat
 
 feats = []
-for f in [compute_pitch, compute_amp, compute_entropy]:
-    feat: xr.DataArray = xr.apply_ufunc(lambda s, b, e: f(s[int(b):int(e)]), 
+for f in tqdm([compute_pitch, compute_amp, compute_entropy], desc="Computing song feats"):
+    feat: xr.DataArray = xr.apply_ufunc(lambda s, b, e: f(s[int(b):int(e)]) if not np.isnan([b, e]).any() else np.nan, 
         dataset["song_data"], dataset["subsyllable_beg"], dataset["subsyllable_end"], 
         input_core_dims=[["song_index"]] + [[]]*2, vectorize=True)
     feat = feat.expand_dims(song_feat=[f.__name__.replace("compute_", "")])
@@ -288,9 +297,13 @@ print(dataset)
 # Dimension reduction
 
 def reduce_pca(a):
+    if np.isnan(a).all():
+        return np.full_like(a, np.nan)
     import sklearn.decomposition
     pca = sklearn.decomposition.PCA()
-    return pca.fit_transform(a)
+    mask = np.isnan(a)
+    a = np.where(mask, np.nanmean(a, axis=0), a)
+    return np.where(mask, np.nan, pca.fit_transform(a))
 
 def reduce_none(a):
     return a
@@ -308,10 +321,16 @@ print(dataset)
 # IFR per syllable
 
 def get_syb_ifr(ifr, start, end):
-    return np.mean(ifr[int(start):int(end)])
+    if not np.isnan([start, end]).any():
+        return np.mean(ifr[int(start):int(end)])
+    return np.nan
+
+dataset["lag_s"] = xr.DataArray(np.linspace(0.020, 0.100, 9), dims="lag_s")
 
 dataset["syb_ifr"] = xr.apply_ufunc(get_syb_ifr,
-    dataset["ifr"], dataset["ifr_fs"] * dataset["subsyllable_beg"]/dataset["song_fs"], dataset["ifr_fs"] * dataset["subsyllable_end"]/dataset["song_fs"], 
+    dataset["ifr"], 
+    dataset["ifr_fs"] * (dataset["subsyllable_beg"]/dataset["song_fs"] - dataset["lag_s"]), 
+    dataset["ifr_fs"] * (dataset["subsyllable_end"]/dataset["song_fs"] - dataset["lag_s"]), 
     input_core_dims=[["ifr_index"]] + [[]]*2, vectorize=True)
 
 print(dataset)
@@ -324,6 +343,9 @@ def dict_to_array(dim, d):
     return a
 
 def get_score(feats, ifr, m):
+    mask = np.isnan(ifr)
+    ifr = ifr[~mask]
+    feats = feats[~mask, :]
     return m.fit(feats, ifr).score(feats, ifr)
 
 
@@ -338,7 +360,7 @@ dataset["model"] = dict_to_array("model_name", dict(
                                                
 dataset["score"] = xr.apply_ufunc(get_score, dataset["feats_reduced"], dataset["syb_ifr"], dataset["model"], input_core_dims=[["syb_num", "song_feat"]] + [["syb_num"]]+[[]], vectorize=True)
 print(dataset)
-dataset["score"].plot(col="syb")
+# dataset["score"].plot(col="syb")
 
 
 
@@ -347,12 +369,15 @@ dataset["score"].plot(col="syb")
 # ============================================================================ #
 # Computing bootstrap
 
-dataset["bt_index"] = xr.DataArray(np.arange(10), dims="bt_index")
+dataset["bt_index"] = xr.DataArray(np.arange(100), dims="bt_index")
 
 progress=tqdm()
 progress.total = dataset["score"].size*dataset["bt_index"].size
 
 def bootstrap_score(feats, ifr, m, i):
+    mask = np.isnan(ifr)
+    ifr = ifr[~mask]
+    feats = feats[~mask, :]
     global progress
     shuffled_ifr = np.random.default_rng().permuted(ifr)
     res= m.fit(feats, shuffled_ifr).score(feats, shuffled_ifr)
@@ -375,14 +400,26 @@ def kde(a, p):
 dataset["kde_points"] = xr.DataArray(np.linspace(-1, 2, 1000), dims="kde_points")
 dataset["bt_score_kde"] = xr.apply_ufunc(kde, dataset["bt_score"], dataset["kde_points"], input_core_dims=[["bt_index"]] + [["kde_points"]], output_core_dims=[["kde_points"]], vectorize=True)
 
+# ============================================================================ #
+# Plotting
 
-f, axs = plt.subplots(dataset["syb"].size, dataset["subsyllable"].size)
 
+f, axs = plt.subplots(dataset["syb"].size, dataset["subsyllable"].size, sharex=True, sharey=True)
+
+first = True
 for i in range(dataset["syb"].size):
     for j in range(dataset["subsyllable"].size):
-        dataset["bt_score_kde"].isel(syb=i, subsyllable=j).sel(scale_method="standard", reduce_method="pca", model_name="linear", drop=True).drop(["song_fs", "ifr_fs"]).plot(ax=axs[i, j], x="kde_points")
-        axs[i, j].axvline(x=dataset["score"].isel(syb=i, subsyllable=j).item())
+        for k in range(dataset["lag_s"].size):
+            kw = dict(label=f'lag={int(dataset["lag_s"].isel(lag_s =k).item()*1000)}ms') if first else {}
+            (
+                dataset["bt_score_kde"].isel(syb=i, subsyllable=j).isel(lag_s=k, drop=True)
+                .sel(scale_method="standard", reduce_method="pca", model_name="linear", drop=True)
+                .drop(["song_fs", "ifr_fs"]).plot.line(ax=axs[i, j], x="kde_points", color=f"C{k}", **kw)
+            )
+            axs[i, j].axvline(x=dataset["score"].isel(syb=i, subsyllable=j, lag_s=k).item(), color=f"C{k}")
+        first =False
 
+f.legend()
 f.tight_layout()
 
 # import xarray.plot as xrp
