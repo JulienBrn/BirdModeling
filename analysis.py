@@ -211,13 +211,15 @@ def split(beg, end, size, offset):
     new_beg = beg+offset
     ids = np.array(range(int((end-new_beg)/size)))
     print(len(ids))
-    ids = np.pad(ids, (0, 300-len(ids)), mode="constant", constant_values=-1)
+    ids = np.pad(ids, (0, 300-len(ids)), mode="constant", constant_values=np.nan)
     return ids
 
-max_subsyllable = ((dataset["end"] - dataset["beg"] + (0.015 * dataset["song_fs"]))/(0.1 * dataset["song_fs"])).max()
+dataset["subsyllable_fs"] = 0.040
+max_subsyllable = ((dataset["end"] - dataset["beg"] + (0.015 * dataset["song_fs"]))/(dataset["subsyllable_fs"] * dataset["song_fs"])).max()
 dataset["subsyllable"] = xr.DataArray(np.arange(max_subsyllable), dims=["subsyllable"])
-dataset["subsyllable_beg"] = dataset["beg"] + (0.015 * dataset["song_fs"]) + (0.1 * dataset["song_fs"]) * dataset["subsyllable"]
-dataset["subsyllable_end"] = dataset["beg"] + (0.015 * dataset["song_fs"]) + (0.1 * dataset["song_fs"]) * (dataset["subsyllable"]+1)
+
+dataset["subsyllable_beg"] = dataset["beg"] + (0.015 * dataset["song_fs"]) + (dataset["subsyllable_fs"] * dataset["song_fs"]) * dataset["subsyllable"]
+dataset["subsyllable_end"] = dataset["beg"] + (0.015 * dataset["song_fs"]) + (dataset["subsyllable_fs"] * dataset["song_fs"]) * (dataset["subsyllable"]+1)
 print(dataset)
 
 
@@ -245,16 +247,16 @@ def compute_pitch(a):
     from pitch import processPitch
     return processPitch(a, dataset["song_fs"].item(), 1000, 10000)
 def compute_amp(a): 
-    return np.mean(a)
+    return np.mean(np.abs(a))
 def compute_entropy(a): 
     from scipy.signal import welch
-    f, p = welch(a)
+    f, p = welch(a, nfft=512)
     p /= np.sum(p)
     power_per_band_mat = p[p > 0]
     spectral_mat = -np.sum(power_per_band_mat * np.log2(power_per_band_mat))
     return spectral_mat
 
-feats = []
+feats=[]
 for f in tqdm([compute_pitch, compute_amp, compute_entropy], desc="Computing song feats"):
     feat: xr.DataArray = xr.apply_ufunc(lambda s, b, e: f(s[int(b):int(e)]) if not np.isnan([b, e]).any() else np.nan, 
         dataset["song_data"], dataset["subsyllable_beg"], dataset["subsyllable_end"], 
@@ -351,8 +353,8 @@ def get_score(feats, ifr, m):
 
 dataset["model"] = dict_to_array("model_name", dict(
     # glm= sklearn.linear_model.PoissonRegressor(), 
-    linear=sklearn.linear_model.LinearRegression(), 
-    # bgmm=sklearn.mixture.BayesianGaussianMixture(),
+    # linear=sklearn.linear_model.LinearRegression(), 
+    bgmm=sklearn.mixture.BayesianGaussianMixture(),
     # gmm=sklearn.mixture.GaussianMixture(),
     # bgmm3=sklearn.mixture.BayesianGaussianMixture(n_components=3),
     # gmm3=sklearn.mixture.GaussianMixture(n_components=3)

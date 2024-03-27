@@ -1,6 +1,6 @@
 import pandas as pd, numpy as np, functools, scipy, xarray as xr
 import toolbox, tqdm, pathlib, concurrent.futures
-from typing import List, Tuple, Dict, Any, Literal
+from typing import List, Tuple, Dict, Any, Literal, Set, Sequence
 import matplotlib.pyplot as plt
 import matplotlib as mpl, seaborn as sns
 from scipy.stats import gaussian_kde
@@ -395,3 +395,217 @@ def group_as_dim(var:str, data: xr.Dataset,  new_dim=None):
     res = xr.concat(list(d.values()), dim=new_dim)
     res[new_dim] = list(d.keys())
     return res
+
+import inspect
+
+class UfuncApplier:
+    in_dims: Dict[str, Sequence[str]] #Mapping from parameter names to function dimension
+    out_dims: Sequence[Sequence[str]] #Mapping from output names to function dimension
+    dims: Set[str] #All function dimensions
+    dim_mapping: Dict[str, Sequence[str]] #Mapping from function dimension to calling array dimension
+
+    def __init__(self, f, in_dims, out_dims, vectorized, array_type):
+        self.f = f
+        sig = inspect.signature(self.f).parameters
+        if not hasattr(in_dims, "items"):
+            in_dims = {str(p): in_dims[i] for i,p in enumerate(sig) if i<len(in_dims)}
+        
+        self.in_dims = in_dims
+        self.out_dims = out_dims
+        self.vectorized = vectorized
+        self.array_type = array_type
+        self.dims = set().union(*([set(v) for v in in_dims.values()] + [set(v) for v in out_dims]))
+        self.dim_mapping = {d:[d] for d in self.dims}
+
+    def map_dims(self, dims=None, **dims_kwargs):
+        dim_dict = dims_kwargs if dims is None else dims
+        if set(dim_dict.keys()) - self.dims != set():
+            raise Exception(f"Dimensions {set(dim_dict.keys()) - self.dims} are unknown")
+        self.dim_mapping.update({k:[v] if isinstance(v, str) else v for k, v in dim_dict.items()})
+        return self
+    
+    def __str__(self):
+        sig = inspect.signature(self.f).parameters
+        l = [f"{p}" if not p in self.in_dims else f"{p} : {self.in_dims[p]}" for p in sig]
+        return f"{'Not vectorized' if not self.vectorized else 'Vectorized'} {self.f}({', '.join(l)})"
+    
+    def __call__(self, *args, **kwargs):
+        sig = inspect.signature(self.f)
+        arg_dict = sig.bind(*args, **kwargs).arguments
+        kwname = [k for k in arg_dict if sig.parameters[k].kind ==inspect.Parameter.VAR_KEYWORD]
+        posname = [k for k in arg_dict if sig.parameters[k].kind ==inspect.Parameter.VAR_POSITIONAL]
+        if posname:
+            posname = posname[0]
+            posname_dict = {f"_pos{i}": v for i,v in enumerate(arg_dict[posname])}
+            arg_dict.pop(posname)
+            arg_dict = dict(**arg_dict, **posname_dict)
+        else:
+            posname_dict= {}
+        
+        if kwname:
+            kwname = kwname[0]
+            kwname_dict = arg_dict[kwname]
+            arg_dict.pop(kwname)
+            arg_dict = dict(**arg_dict, **kwname_dict)
+        else:
+            kwname_dict= {}
+        
+        arg_names = list(arg_dict.keys())
+        def get_in_dims(k):
+            if k in kwname_dict and kwname in self.in_dims:
+                return self.in_dims[kwname]
+            elif k in posname_dict and posname in self.in_dims:
+                return self.in_dims[posname]
+            elif k in self.in_dims:
+                return self.in_dims[k]
+            else:
+                return []
+            
+        in_dims = {k: get_in_dims(k) for k in arg_names}
+        positions = [k for (k, p) in sig.parameters.items() if p.kind==inspect.Parameter.POSITIONAL_OR_KEYWORD | p.kind==inspect.Parameter.POSITIONAL_ONLY]
+        if posname:
+            positions+=list(posname_dict.keys())
+        input_core_dims = {k: [self.dim_mapping[d] for d in in_dims[k]] for k in arg_names}
+        output_core_dims = {k: [self.dim_mapping[d] for d in l] for k, l in enumerate(self.out_dims)}
+
+        
+        def inner(*args):
+            input_dimension_shapes = {}
+            mapped_shape = {}
+            for k, arg in zip(arg_names, args):
+                arg_shape = np.shape(arg)
+                input_dims_size = np.sum([len(self.dim_mapping[d]) for d in in_dims[k]]).astype(int)
+                # print(arg_shape, input_dims_size)
+                curr = len(arg_shape) - input_dims_size
+                # print(curr)
+                mapped_shape[k] = arg_shape[:curr]
+                for d in in_dims[k]:
+                    input_dimension_shapes[d] = arg_shape[curr: curr+len(self.dim_mapping[d])]
+                    curr+=len(self.dim_mapping[d])
+
+            # print(input_dimension_shapes)
+            new_args={k: np.reshape(arg, mapped_shape[k] +tuple(np.prod(input_dimension_shapes[d]) for d in in_dims[k])) for k,arg in zip(arg_names, args)}
+            posargs = [new_args[k] for k in positions]
+            keywordargs = {k: v for k, v in new_args.items() if not k in positions}
+            res = self.f(*posargs, **keywordargs)
+            rm_tuple=False
+            if not isinstance(res, tuple):
+                res = (res,)
+                rm_tuple=True
+            output_shape = [() for _ in res]
+            for i, r in enumerate(res):
+                r_shape = np.shape(r)
+                curr = len(r_shape) - len(self.out_dims[i])
+                output_shape[i]+= r_shape[: curr]
+                for d in enumerate(self.out_dims[i]):
+                    output_shape[i]+=input_dimension_shapes[d] if d in input_dimension_shapes else (r_shape[curr],)
+                    curr+=1
+            # print([r.shape for r in res])
+            new_res = tuple(np.reshape(r, output_shape[i]) for i, r in enumerate(res))
+            # print([r.shape for r in new_res])
+            # print(new_res)
+            return new_res if not rm_tuple else new_res[0]
+
+        res = xr.apply_ufunc(inner, *[arg_dict[k] for k in arg_names], 
+            input_core_dims=[sum(input_core_dims[k], []) for k in arg_names],
+            output_core_dims=[sum(output_core_dims[k], []) for k in output_core_dims],
+            vectorize=not self.vectorized,
+        )
+
+
+        
+        
+        return res
+    
+    def exec(self, *args, **kwargs): return self.__call__(*args, **kwargs)
+
+class tmp:
+    def __init__(self, f, in_dims, out_dims, vectorized, array_type):
+        self.f = f
+        self.xr = UfuncApplier(f, in_dims, out_dims, vectorized, array_type)
+    def __call__(self, *args, **kwargs):
+        return self.f(*args, **kwargs)
+
+def xrfunc(in_dims={}, out_dims=[[]], vectorized=False, array_type="numpy"):
+    def decorator(f):
+        return tmp(f, in_dims, out_dims, vectorized, array_type)
+    return decorator
+
+def oldxrfunc(in_dims={}, out_dims=[[]], vectorized=False, array_type="numpy"):
+    in_dimension_list=[d for v in in_dims.values() for d in v]
+    def decorator(f):
+        def new_f(*args, dims=None,  ufunc_kwargs=None, **kwargs):
+            dim_dict = kwargs if dims is None else dims
+            in_dims_mapping = {d: [d] if not d in dim_dict else [dim_dict[d]] if isinstance(dim_dict, str) else dim_dict[d]}
+            removed_dict_keys = [k for k in d for d in [dims, ufunc_kwargs] if not d is None]
+            fkwargs = {k:v for k,v in kwargs.items() if k not in removed_dict_keys}
+
+            arg_dict = inspect.signature(f).bind(*args, **fkwargs).arguments
+            arg_names = list(arg_dict.keys())
+
+
+            input_core_dims = {k:[] for k in arg_names}
+            reshape_sizes = {k:[] for k in arg_names}
+            for k in arg_names:
+                if k in in_dims:
+                    mdim = in_dims[k]
+                    for d in mdim:
+                        if d in kwargs:
+                            if isinstance(kwargs[d], str):
+                                input_core_dims[k].append(kwargs[d])
+                                reshape_sizes[k].append(1)
+                            else:
+                                # print(input_core_dims[k])
+                                input_core_dims[k]+=kwargs[d]
+                                # print(input_core_dims[k])
+                                reshape_sizes[k].append(len(kwargs[d]))
+                        else:
+                            raise Exception("Not handled yet")
+            # input_core_dims = {k: ([kwargs[d] for d in in_dims[k]] if k in in_dims else []) for k in arg_dict}
+            # input_core_dims ={k}
+            
+            def inner(*args): 
+                # print("inner !")
+                new_args =[]
+                for i, arg in enumerate(args):
+                    try:
+                        if len(np.shape(arg))==0:
+                            new_args.append(arg)
+                            continue
+                        k = arg_names[i]
+                        reshapes = reshape_sizes[k]
+                        total = np.sum(reshapes)
+                        arg_shape = np.shape(arg)
+                        start = len(arg_shape) - total
+                        new_shape = [s for i,s in enumerate(arg_shape) if i < start] 
+                        curr = start
+                        for curr_reshape in range(len(reshapes)):
+                            new_shape.append(np.prod(arg_shape[curr:curr+reshapes[curr_reshape]]))
+                            curr+=reshapes[curr_reshape]
+                        new_args.append(np.reshape(arg, new_shape))
+                    except:
+                        print(type(arg))
+                        raise
+                ret = f(*new_args)
+                return ret
+            # print(f"Input_core_dims = {input_core_dims}")
+            # print(*[arg_dict[k] for k in arg_names])
+            return xr.apply_ufunc(inner, *[arg_dict[k] for k in arg_names], input_core_dims=[input_core_dims[k] for k in arg_names], vectorize = not vectorized)
+        return new_f
+    return decorator
+
+
+
+# @xrfunc(vectorize=False, in_dims=dict(a=["samples", "features"]), out_dims=dict(pca = ["samples", "pca_features"]))
+# def pca(a, *args):
+#     pass
+
+# pca(a, samples=["t", "x"], features="g")
+
+# def apply_xrfunc(func, *args, vectorize="auto", join="exact", **kwargs):
+#     if hasattr(func, "_xrarray_ufunc"):
+
+
+
+    # new_input_core_dims = [[d for d in input_core_dims if hasattr(arg, "dims") and d in arg.dims] for arg in args]
+    # if hasattr(func, "_supports_vectorization")
