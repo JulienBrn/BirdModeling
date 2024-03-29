@@ -1,6 +1,6 @@
 import pandas as pd, numpy as np, functools, scipy, xarray as xr
 import toolbox, tqdm, pathlib, concurrent.futures
-from typing import List, Tuple, Dict, Any, Literal, Set, Sequence
+from typing import List, Tuple, Dict, Any, Literal, Set, Sequence, Callable, Mapping
 import matplotlib.pyplot as plt
 import matplotlib as mpl, seaborn as sns
 from scipy.stats import gaussian_kde
@@ -398,13 +398,55 @@ def group_as_dim(var:str, data: xr.Dataset,  new_dim=None):
 
 import inspect
 
+def tmp(f, *args, _mappings= None, _missing_values= None, **kwargs):
+    new_args = []
+    new_f = f
+    new_mapping = []
+    #such that new_f(*new_args) is equivalent to f(*args, **kwargs)
+    # and new_mapping[k] = mapping[new_args[k]]
+
+def simplify_decorators(f: Callable, *args, _mappings: Sequence[Mapping[str, Any]]= None, _missing_values: Sequence[Any]= [], **kwargs):
+    sig = inspect.signature(f)
+    parameters = sig.parameters
+    bind = sig.bind(*args, **kwargs)
+    arg_dict = bind.arguments
+
+    positional_mapping = {k:arg_dict[k] for k, p in parameters.items() if p.kind == inspect.Parameter.POSITIONAL_OR_KEYWORD | inspect.Parameter.POSITIONAL_ONLY}
+    positional_args = tuple(positional_mapping.values()) + bind.args
+
+    keyword_args = {k: arg_dict[k] for k, p in parameters.items() if p.kind == inspect.Parameter.KEYWORD_ONLY}
+    new_args = positional_args + tuple(keyword_args.values()) + tuple(bind.kwargs.values())
+
+    kwname = [k for k in parameters if parameters[k].kind ==inspect.Parameter.VAR_KEYWORD]
+    posname = [k for k in parameters if parameters[k].kind ==inspect.Parameter.VAR_POSITIONAL]
+
+    def new_f(*args):
+        pos_args = args[:len(positional_args)]
+        keyword_args = {k:arg for k,arg in zip(tuple(keyword_args.keys()) + tuple(bind.kwargs.keys()) , args[len(positional_args):])} 
+        return f(*pos_args, **keyword_args)
+    
+
+    def transform_mapping(m: Mapping[str, Any], missing_value):
+        positional_map = [m[k] if k in m else missing_value for k in positional_mapping]
+        var_pos_map = ([m[posname] if posname in m else missing_value] * len(bind.args)) if posname else []
+        keyword_map = [m[k] if k in m else missing_value for k in keyword_args.keys()]
+        var_keyword_map = ([m[kwname] if kwname in m else missing_value] * len(bind.kwargs)) if kwname else []
+        return positional_map + var_pos_map + keyword_map + var_keyword_map
+
+    if not _mappings is None:
+        new_mappings = [transform_mapping(m, mv) for m, mv in zip(_mappings, _missing_values)]
+        return new_f, new_args, new_mappings
+    else:
+        return new_f, new_args
+
+
 class UfuncApplier:
     in_dims: Dict[str, Sequence[str]] #Mapping from parameter names to function dimension
     out_dims: Sequence[Sequence[str]] #Mapping from output names to function dimension
     dims: Set[str] #All function dimensions
     dim_mapping: Dict[str, Sequence[str]] #Mapping from function dimension to calling array dimension
 
-    def __init__(self, f, in_dims, out_dims, vectorized, array_type):
+    def __init__(self, f, in_dims, out_dims, output_dtypes, vectorized, array_type):
         self.f = f
         sig = inspect.signature(self.f).parameters
         if not hasattr(in_dims, "items"):
@@ -414,8 +456,18 @@ class UfuncApplier:
         self.out_dims = out_dims
         self.vectorized = vectorized
         self.array_type = array_type
+        self.output_dtypes = output_dtypes
         self.dims = set().union(*([set(v) for v in in_dims.values()] + [set(v) for v in out_dims]))
         self.dim_mapping = {d:[d] for d in self.dims}
+        self.out_dims_only = {d for d in self.dims if not d in set().union(*[set(v) for v in in_dims.values()])}
+        self.model_sizes = {}
+        # if "t_bin" in self.dims:
+        #     self.apply_ufunc_kwargs = dict(dask="parallelized", dask_gufunc_kwargs=dict(allow_rechunk=True, output_sizes=dict(t_bin=44, f=129)))
+        # else:
+        #     self.apply_ufunc_kwargs = dict(dask="parallelized", dask_gufunc_kwargs=dict(allow_rechunk=True))
+    def set_model(self, d: xr.Dataset):
+        self.model_sizes = d.sizes
+        return self
 
     def map_dims(self, dims=None, **dims_kwargs):
         dim_dict = dims_kwargs if dims is None else dims
@@ -467,49 +519,76 @@ class UfuncApplier:
             positions+=list(posname_dict.keys())
         input_core_dims = {k: [self.dim_mapping[d] for d in in_dims[k]] for k in arg_names}
         output_core_dims = {k: [self.dim_mapping[d] for d in l] for k, l in enumerate(self.out_dims)}
-
-        
+        output_dim_sizes = {k: self.model_sizes[k] for k in self.out_dims_only if k in self.model_sizes}
+        input_core_dims_xarray = [sum(input_core_dims[k], []) for k in arg_names]
+        output_core_dims_xarray = [sum(output_core_dims[k], []) for k in output_core_dims]
+        vectorize_str = (
+            ",".join("({})".format(",".join(dims)) for dims in input_core_dims_xarray)
+            + "->"
+            + ",".join("({})".format(",".join(dims)) for dims in output_core_dims_xarray)
+        ) 
+        if not self.vectorized:
+            vectorized_func = np.vectorize(
+                self.f,
+                otypes=self.output_dtypes,
+                signature=vectorize_str,
+            )
+            print(vectorize_str)
+            print(self.output_dtypes)
         def inner(*args):
-            input_dimension_shapes = {}
-            mapped_shape = {}
-            for k, arg in zip(arg_names, args):
-                arg_shape = np.shape(arg)
-                input_dims_size = np.sum([len(self.dim_mapping[d]) for d in in_dims[k]]).astype(int)
-                # print(arg_shape, input_dims_size)
-                curr = len(arg_shape) - input_dims_size
-                # print(curr)
-                mapped_shape[k] = arg_shape[:curr]
-                for d in in_dims[k]:
-                    input_dimension_shapes[d] = arg_shape[curr: curr+len(self.dim_mapping[d])]
-                    curr+=len(self.dim_mapping[d])
+            try:
+                input_dimension_shapes = {}
+                mapped_shape = {}
+                for k, arg in zip(arg_names, args):
+                    arg_shape = np.shape(arg)
+                    input_dims_size = np.sum([len(self.dim_mapping[d]) for d in in_dims[k]]).astype(int)
+                    # print(arg_shape, input_dims_size)
+                    curr = len(arg_shape) - input_dims_size
+                    # print(curr)
+                    mapped_shape[k] = arg_shape[:curr]
+                    for d in in_dims[k]:
+                        input_dimension_shapes[d] = arg_shape[curr: curr+len(self.dim_mapping[d])]
+                        curr+=len(self.dim_mapping[d])
 
-            # print(input_dimension_shapes)
-            new_args={k: np.reshape(arg, mapped_shape[k] +tuple(np.prod(input_dimension_shapes[d]) for d in in_dims[k])) for k,arg in zip(arg_names, args)}
-            posargs = [new_args[k] for k in positions]
-            keywordargs = {k: v for k, v in new_args.items() if not k in positions}
-            res = self.f(*posargs, **keywordargs)
-            rm_tuple=False
-            if not isinstance(res, tuple):
-                res = (res,)
-                rm_tuple=True
-            output_shape = [() for _ in res]
-            for i, r in enumerate(res):
-                r_shape = np.shape(r)
-                curr = len(r_shape) - len(self.out_dims[i])
-                output_shape[i]+= r_shape[: curr]
-                for d in enumerate(self.out_dims[i]):
-                    output_shape[i]+=input_dimension_shapes[d] if d in input_dimension_shapes else (r_shape[curr],)
-                    curr+=1
-            # print([r.shape for r in res])
-            new_res = tuple(np.reshape(r, output_shape[i]) for i, r in enumerate(res))
-            # print([r.shape for r in new_res])
-            # print(new_res)
-            return new_res if not rm_tuple else new_res[0]
+                # print(input_dimension_shapes)
+                new_args={k: np.reshape(arg, mapped_shape[k] +tuple(np.prod(input_dimension_shapes[d]) for d in in_dims[k])) for k,arg in zip(arg_names, args)}
+                if not self.vectorized:
+                    new_args={k:v if not input_core_dims[k] == [] else v.item() for k,v in new_args.items()}
+                posargs = [new_args[k] for k in positions]
+                keywordargs = {k: v for k, v in new_args.items() if not k in positions}
+                res = (self.f if self.vectorized else  vectorized_func)(*posargs, **keywordargs) 
+                rm_tuple=False
+                if not isinstance(res, tuple):
+                    res = (res,)
+                    rm_tuple=True
+                output_shape = [() for _ in res]
+                for i, r in enumerate(res):
+                    r_shape = np.shape(r)
+                    curr = len(r_shape) - len(self.out_dims[i])
+                    output_shape[i]+= r_shape[: curr]
+                    for d in enumerate(self.out_dims[i]):
+                        output_shape[i]+=input_dimension_shapes[d] if d in input_dimension_shapes else (r_shape[curr],)
+                        curr+=1
+                # print([r.shape for r in res])
+                new_res = tuple(np.reshape(r, output_shape[i]) for i, r in enumerate(res))
+                # print([r.shape for r in new_res])
+                # print(new_res)
+                return new_res if not rm_tuple else new_res[0]
+            except Exception as e:
+                e.add_note(f"While computing {self.f}")
+                raise
+             
 
+
+        apply_ufunckw = dict(dask="parallelized", dask_gufunc_kwargs=dict(allow_rechunk=True, output_sizes=output_dim_sizes))
+        if not self.output_dtypes is None:
+            apply_ufunckw["output_dtypes"]=self.output_dtypes
         res = xr.apply_ufunc(inner, *[arg_dict[k] for k in arg_names], 
             input_core_dims=[sum(input_core_dims[k], []) for k in arg_names],
             output_core_dims=[sum(output_core_dims[k], []) for k in output_core_dims],
-            vectorize=not self.vectorized,
+            vectorize=False,
+            **apply_ufunckw
+            
         )
 
 
@@ -520,16 +599,17 @@ class UfuncApplier:
     def exec(self, *args, **kwargs): return self.__call__(*args, **kwargs)
 
 class tmp:
-    def __init__(self, f, in_dims, out_dims, vectorized, array_type):
+    def __init__(self, f, in_dims, out_dims, output_dtypes, vectorized, array_type):
         self.f = f
-        self.xr = UfuncApplier(f, in_dims, out_dims, vectorized, array_type)
+        self.xr = UfuncApplier(f, in_dims, out_dims, output_dtypes, vectorized, array_type)
     def __call__(self, *args, **kwargs):
         return self.f(*args, **kwargs)
 
-def xrfunc(in_dims={}, out_dims=[[]], vectorized=False, array_type="numpy"):
+def xrfunc(in_dims={}, out_dims=[[]], output_dtypes = None, vectorized=False, array_type="numpy"):
     def decorator(f):
-        return tmp(f, in_dims, out_dims, vectorized, array_type)
+        return tmp(f, in_dims, out_dims, output_dtypes, vectorized, array_type)
     return decorator
+
 
 def oldxrfunc(in_dims={}, out_dims=[[]], vectorized=False, array_type="numpy"):
     in_dimension_list=[d for v in in_dims.values() for d in v]
